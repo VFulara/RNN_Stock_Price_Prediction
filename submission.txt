@@ -1,0 +1,13 @@
+Lending club case study : https://github.com/VFulara/RNN_Stock_Price_Prediction
+
+Submission by
+Group 1
+Sharath Hosakote Sudhakrishna
+Vaibhav Fulara
+Banetta Nedunchezhiyan
+Karthik Reddy
+Tarun Garg
+
+python notebook name:
+final.ipynb
+
