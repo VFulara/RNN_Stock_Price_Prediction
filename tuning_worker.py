@@ -4,7 +4,7 @@ import tensorflow as tf                     # <--- CRITICAL FIX INCLUDED HERE
 from tensorflow.keras.models import Sequential # <--- CRITICAL FIX INCLUDED HERE
 from tensorflow.keras.layers import LSTM, GRU, SimpleRNN, Dense, Dropout, LeakyReLU
 from tensorflow.keras.optimizers import Adam, SGD
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.model_selection import TimeSeriesSplit
 
 # Create a function that creates a simple RNN model according to the model configuration arguments
@@ -47,26 +47,31 @@ def create_rnn_model(input_shape, rnn_type='LSTM', rnn_units=64, dense_units=32,
 
 
 
-def custom_grid_search_for_rnn(config_dict, X_data, y_data, permutation_id, total_runs, rnn_type='SimpleRNN'):
-    # CRITICAL FIX: Force this specific process to initialize its own clean, 
-    # isolated virtual CPU device thread so it never conflicts with other concurrent processes.
-    tf.config.set_visible_devices([], 'GPU') # Turn off GPU allocation for this process
+def custom_grid_search_for_rnn(config_dict, X_data, y_data, df_train, permutation_id, total_runs, rnn_type='SimpleRNN'):
+    """
+    Executes a custom forward-chaining grid search fold routine.
+    Leverages df_train metadata to reverse rolling Z-score normalization dynamically 
+    per fold, evaluating Close Price using true unscaled RMSE and Theil's U Statistic.
+    """
+    # Force this specific process to initialize its own clean, isolated CPU thread
+    tf.config.set_visible_devices([], 'GPU') 
 
     print(f"-> Starting Job [{permutation_id}/{total_runs}]: {config_dict['rnn_units']} | Batch: {config_dict['batch_size']}")
 
     tscv = TimeSeriesSplit(n_splits=3)
     fold_val_losses = []
-    fold_hit_rates = []
+    fold_unscaled_rmses = []
+    fold_theils_u = []
 
-    # Execute chronological forward-chaining folds
+    # Execute chronological forward-chaining splits
     for train_idx, val_idx in tscv.split(X_data):
         X_tr, X_val = X_data[train_idx], X_data[val_idx]
         y_tr, y_val = y_data[train_idx], y_data[val_idx]
 
-        # Instantiate model from global wrapper function
-        # We unpack using local keys to match your custom wrapper function signature
+        # Instantiate model from custom global wrapper function
+        # Dynamically matches features input size (e.g., shape of index 2 of your matrix)
         model = create_rnn_model(
-            input_shape=(21,5),
+            input_shape=(21, X_data.shape[2]),
             rnn_type=rnn_type,
             rnn_units=config_dict['rnn_units'],
             dense_units=config_dict['dense_units'],
@@ -81,36 +86,70 @@ def custom_grid_search_for_rnn(config_dict, X_data, y_data, permutation_id, tota
         else:
             opt = SGD(learning_rate=config_dict['learning_rate'])
 
-        model.compile(optimizer=opt, loss='mse')
+        model.compile(optimizer=opt, loss=config_dict['loss_function'])
 
-        early_stop = EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True)
+        # Tightened parameters to catch local validation minimums and mitigate drift
+        lrReducerOnPlateau = ReduceLROnPlateau(
+            monitor='val_loss', 
+            mode='min', 
+            factor=config_dict['lr_factor'], 
+            patience=config_dict['lr_patience'], 
+            min_delta=0
+        )
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
         # Train strictly on this worker's assigned internal thread
         with tf.device('/CPU:0'):
             model.fit(
                 X_tr, y_tr,
                 validation_data=(X_val, y_val),
-                epochs=20,
+                epochs=40,
                 batch_size=config_dict['batch_size'],
-                callbacks=[early_stop],
+                callbacks=[lrReducerOnPlateau, early_stop],
                 verbose=0,
                 shuffle=False
             )
 
-        # 1. Evaluate distance performance (MSE)
+        # 1. Track optimal validation loss (Corresponds to your native training scale, e.g., MAE)
         best_loss = min(model.history.history['val_loss'])
         fold_val_losses.append(best_loss)
 
-        # 2. Evaluate directional prediction performance (Directional Hit Rate)
-        preds = model.predict(X_val, verbose=0).flatten()
-        hit_rate = np.mean(np.sign(y_val) == np.sign(preds))
-        fold_hit_rates.append(hit_rate)
+        # 2. Extract scaled predictions on validation slice
+        preds_scaled = model.predict(X_val, verbose=0).flatten()
+        y_val_flat = y_val.flatten()
 
-        # Package final combined results for this specific parameter set
+        # 3. CRUCIAL UNIPOTENT INDEX FIX: 
+        # Extract the exact rolling mean and std mapped to this validation fold's true chronological row indices
+        meta_slice = df_train.iloc[val_idx]
+        val_means = meta_slice["y_mean"].values
+        val_stds = meta_slice["y_std"].values
+
+        # 4. REVERSE WINDOW SCALING: Manually convert values back to original unscaled dollar amounts
+        preds_original = (preds_scaled * (val_stds + 1e-8)) + val_means
+        y_val_original = (y_val_flat * (val_stds + 1e-8)) + val_means
+
+        # 5. METRIC EVALUATION A: Calculate true, uninflated RMSE in real currency units
+        unscaled_rmse = np.sqrt(np.mean((y_val_original - preds_original) ** 2))
+        fold_unscaled_rmses.append(unscaled_rmse)
+
+        # 6. METRIC EVALUATION B: Calculate Theil's U Statistic to benchmark against a random walk
+        # Naive forecast assumption: Tomorrow's Close Price equals Today's Close Price
+        naive_preds = y_val_original[:-1]
+        actual_today = y_val_original[1:]
+        model_preds_today = preds_original[1:]
+
+        model_rmse_horizon = np.sqrt(np.mean((actual_today - model_preds_today) ** 2))
+        naive_rmse_horizon = np.sqrt(np.mean((actual_today - naive_preds) ** 2))
+
+        theils_u = model_rmse_horizon / (naive_rmse_horizon + 1e-8)
+        fold_theils_u.append(theils_u)
+
+        # Package unified record including your new multi-metric evaluations
     result_record = {**config_dict} 
-    result_record["Mean Val MSE"] = round(np.mean(fold_val_losses), 4)
-    # Store directional metrics as a float for sorting purposes later
-    result_record["Mean Hit Rate"] = np.mean(fold_hit_rates)
+    result_record["Mean Val MAE"] = round(np.mean(fold_val_losses), 4)
+    result_record["Mean Unscaled RMSE"] = round(np.mean(fold_unscaled_rmses), 4)
+    result_record["Mean Theils U"] = round(np.mean(fold_theils_u), 4)
 
-    print(f"<= Completed Job [{permutation_id}/{total_runs}]: MSE = {result_record['Mean Val MSE']} | Hit Rate = {result_record['Mean Hit Rate']:.2%}")
+    # ERROR WAS HERE: Changed 'Mean Unscaled_RMSE' to 'Mean Unscaled RMSE'
+    print(f"<= Completed Job [{permutation_id}/{total_runs}]: MAE Loss = {result_record['Mean Val MAE']} | Unscaled RMSE = ${result_record['Mean Unscaled RMSE']} | Theil's U = {result_record['Mean Theils U']}")
     return result_record
